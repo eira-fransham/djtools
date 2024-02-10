@@ -1,3 +1,7 @@
+use arrayvec::ArrayVec;
+use binrw::{binrw, BinRead, BinReaderExt, BinResult, BinWrite, Endian, NullWideString};
+use encoding_rs::{Encoding, UTF_16BE};
+use std::io::{self, Read};
 
 #[binrw]
 #[brw(repr = u8)]
