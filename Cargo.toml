@@ -1,0 +1,16 @@
+[package]
+name = "djtools"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+dashmap = "5"
+binrw = "0.13"
+acc_reader = "2"
+chrono = "0.4"
+parking_lot = "0.12"
+encoding_rs = "0.8"
+bytemuck = "1"
+arrayvec = "0.7"
