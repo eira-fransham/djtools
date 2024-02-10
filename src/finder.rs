@@ -1,9 +1,7 @@
 use acc_reader::AccReader;
-use arrayvec::ArrayVec;
-use binrw::{binrw, BinRead, BinReaderExt, BinResult, BinWrite, Endian, NullWideString};
-use chrono::{NaiveDate, NaiveDateTime, Utc};
+use binrw::{binrw, BinReaderExt, Endian};
+use chrono::{NaiveDateTime, Utc};
 use dashmap::{mapref::entry::Entry, DashMap};
-use encoding_rs::{Encoding, UTF_16BE};
 use parking_lot::{Mutex, MutexGuard};
 use std::{
     borrow::Cow,
@@ -12,7 +10,6 @@ use std::{
     io::{self, ErrorKind, Read, Result, Write},
     iter::Map,
     marker::PhantomData,
-    mem,
     net::{SocketAddr, ToSocketAddrs, UdpSocket},
 };
 

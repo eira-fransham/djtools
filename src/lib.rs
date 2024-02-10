@@ -1,7 +1,5 @@
-mod finder;
 mod database;
-
-use finder::*;
+mod finder;
 
 pub fn add(left: usize, right: usize) -> usize {
     left + right
