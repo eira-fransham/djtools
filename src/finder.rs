@@ -1,6 +1,6 @@
 use acc_reader::AccReader;
 use arrayvec::ArrayVec;
-use binrw::{binrw, BinRead, BinReaderExt, BinResult, BinWrite, Endian};
+use binrw::{binrw, io::BufReader, BinRead, BinReaderExt, BinResult, BinWrite, Endian};
 use chrono::{NaiveDateTime, Utc};
 use dashmap::{
     mapref::{entry::Entry, multiple::RefMulti},
@@ -12,10 +12,10 @@ use std::{
     collections::{btree_map, hash_map::RandomState, BTreeMap},
     ffi::CStr,
     hash::BuildHasher,
-    io::{self, ErrorKind, Read, Result, Write},
+    io::{self, ErrorKind, Read, Result, Seek as _, Write},
     iter::Map,
     marker::PhantomData,
-    net::{SocketAddr, ToSocketAddrs, UdpSocket},
+    net::{Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket},
     str,
 };
 
@@ -42,6 +42,9 @@ pub trait Socket {
     type Reader<'a>: Read + GetSource<Addr = Self::Addr>
     where
         Self: 'a;
+
+    fn mac_addr(&self) -> [u8; 6];
+    fn ip_addr(&self) -> (u32, u16);
 
     fn receiver_from(&self) -> Result<Self::Reader<'_>>;
     fn set_nonblocking(&self, _: bool) -> Result<()>;
@@ -215,6 +218,17 @@ impl Socket for UdpSocket {
     type Addr = SocketAddr;
     type Reader<'a> = UdpReader<'a>;
 
+    fn ip_addr(&self) -> (u32, u16) {
+        match self.local_addr().unwrap() {
+            SocketAddr::V4(v4) => (v4.ip().to_bits(), v4.port()),
+            SocketAddr::V6(_) => todo!(),
+        }
+    }
+
+    fn mac_addr(&self) -> [u8; 6] {
+        mac_address::get_mac_address().unwrap().unwrap().bytes()
+    }
+
     fn receiver_from(&self) -> Result<Self::Reader<'_>> {
         Self::Reader::new(self)
     }
@@ -256,6 +270,9 @@ type LastSeen = BTreeMap<NaiveDateTime, Vec<DeviceId>>;
 
 pub struct Finder<S: Socket, MapState = RandomState> {
     socket: S,
+    device_id: u8,
+    mac_addr: [u8; 6],
+    name: Cow<'static, str>,
     devices: DashMap<DeviceId, Device<<S as Socket>::Addr>, MapState>,
     by_last_seen: Mutex<LastSeen>,
     last_purge: NaiveDateTime,
@@ -271,8 +288,13 @@ impl Finder<UdpSocket> {
 
 impl<S: Socket, MapState: BuildHasher + Clone + Default> Finder<S, MapState> {
     pub fn from_socket(socket: S) -> Self {
+        let mac_addr = socket.mac_addr();
         Self {
             socket,
+            // TODO: Make this properly configurable
+            device_id: 6,
+            mac_addr,
+            name: "Hello, world!".into(),
             devices: Default::default(),
             by_last_seen: Default::default(),
             last_purge: NaiveDateTime::UNIX_EPOCH,
@@ -284,72 +306,69 @@ const PURGE_FREQUENCY_MS: usize = 1000;
 const PURGE_MAX_AGE_MS: usize = 5000;
 
 impl<S: Socket, MapState: BuildHasher + Clone> Finder<S, MapState> {
+    pub fn socket(&self) -> &S {
+        &self.socket
+    }
+
     pub fn update_known_devices(&self) -> Result<()> {
-        dbg!();
-        let recv = match self.socket.receiver_from() {
-            Ok(recv) => recv,
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),
-            Err(other) => return Err(other),
-        };
-        dbg!();
-        let addr = recv.source().clone();
-        dbg!();
-
-        dbg!();
-        let mut by_last_seen = self.by_last_seen.lock();
-        dbg!();
-
-        // TODO: We shouldn't just crash when receiving an invalid packet
-        let linkpacket: DeviceLink = AccReader::new(recv)
-            .read_type(Endian::Big)
-            .map_err(|e| io::Error::new(ErrorKind::Other, e))?;
         let now = Utc::now().naive_utc();
 
-        dbg!(&linkpacket);
+        let mut by_last_seen = self.by_last_seen.lock();
 
-        let id = DeviceId(linkpacket.device_id as _);
+        loop {
+            let recv = match self.socket.receiver_from() {
+                Ok(recv) => recv,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(other) => return Err(other),
+            };
+            let addr = recv.source().clone();
 
-        dbg!();
-        match self.devices.entry(id) {
-            Entry::Occupied(mut entry) => {
-                dbg!();
-                let entry = entry.get_mut();
-                entry.num_packets += 1;
-                let last_seen = entry.last_seen;
-                entry.last_seen = now;
-                if let Some(ids) = by_last_seen.get_mut(&last_seen) {
-                    if let Ok(i) = ids.binary_search(&id) {
-                        ids.remove(i);
+            let recv = BufReader::new(recv);
+
+            // TODO: We shouldn't just crash when receiving an invalid packet
+            let linkpacket: DeviceLink = match AccReader::new(recv)
+                .read_type(Endian::Big)
+                .map_err(|e| io::Error::new(ErrorKind::Other, e))
+            {
+                Ok(packet) => packet,
+                Err(_) => continue,
+            };
+
+            let id = DeviceId(linkpacket.device_id as _);
+
+            match self.devices.entry(id) {
+                Entry::Occupied(mut entry) => {
+                    let entry = entry.get_mut();
+                    entry.num_packets += 1;
+                    let last_seen = entry.last_seen;
+                    entry.last_seen = now;
+                    if let Some(ids) = by_last_seen.get_mut(&last_seen) {
+                        if let Ok(i) = ids.binary_search(&id) {
+                            ids.remove(i);
+                        }
                     }
                 }
-                dbg!();
+                Entry::Vacant(entry) => {
+                    entry.insert(Device {
+                        last_seen: now,
+                        num_packets: 1,
+                        address: addr,
+                    });
+                }
             }
-            Entry::Vacant(entry) => {
-                dbg!();
-                entry.insert(Device {
-                    last_seen: now,
-                    num_packets: 1,
-                    address: addr,
-                });
-                dbg!();
+
+            match by_last_seen.entry(now) {
+                btree_map::Entry::Occupied(mut entry) => {
+                    entry.get_mut().push(id);
+                }
+                btree_map::Entry::Vacant(entry) => {
+                    entry.insert(vec![id]);
+                }
             }
         }
 
-        dbg!();
-        match by_last_seen.entry(now) {
-            btree_map::Entry::Occupied(mut entry) => {
-                entry.get_mut().push(id);
-            }
-            btree_map::Entry::Vacant(entry) => {
-                entry.insert(vec![id]);
-            }
-        }
-
-        dbg!();
         if (now - self.last_purge).num_milliseconds() >= PURGE_FREQUENCY_MS as i64 {
-            dbg!();
             self.purge(&mut by_last_seen);
-            dbg!();
         }
 
         Ok(())
@@ -372,6 +391,38 @@ impl<S: Socket, MapState: BuildHasher + Clone> Finder<S, MapState> {
                 break;
             }
         }
+    }
+}
+
+impl<S: NetworkSendSocket, MapState: BuildHasher + Clone> Finder<S, MapState> {
+    pub fn send_keepalive(&self) -> io::Result<()> {
+        let (ip_addr, _) = self.socket.ip_addr();
+
+        let message = DeviceLink {
+            header: Header {
+                header_type: 0x06,
+                name: self.name.as_ref().into(),
+            },
+            device_id: self.device_id,
+            mac_addr: self.mac_addr,
+            ip_addr,
+        };
+
+        let mut out_bytes = io::Cursor::new(vec![0u8; 64]);
+
+        message
+            .write(&mut out_bytes)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+        let mut sender = self
+            .socket
+            .sender_to((Ipv4Addr::BROADCAST, DEFAULT_ANNOUNCE_PORT));
+        let size = out_bytes.seek(io::SeekFrom::Current(0))?;
+        let mut out_bytes = out_bytes.into_inner();
+        out_bytes.truncate(size as usize);
+        sender.write_all(&out_bytes)?;
+
+        Ok(())
     }
 }
 
@@ -471,7 +522,7 @@ struct DeviceLink {
     #[bw(calc = ())]
     _unknown0: (),
     mac_addr: [u8; 6],
-    ip_addr: [u8; 6],
+    ip_addr: u32,
     #[brw(magic(0x0200u16))]
     #[bw(calc = ())]
     _unknown1: (),
@@ -530,7 +581,7 @@ mod test {
         const ANNOUNCE_MESSAGE: &[u8] = &[
             81, 115, 112, 116, 49, 87, 109, 74, 79, 76, 6, 0, 72, 101, 108, 108, 111, 44, 32, 119,
             111, 114, 108, 100, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 0, 54, 1, 1, 1, 0, 3, 0, 5, 0, 0, 5,
-            0, 3, 0, 1, 2, 0, 0, 0, 1, 100,
+            0, 3, 2, 0, 0, 0, 1, 100,
         ];
 
         let message = DeviceLink {
@@ -540,7 +591,7 @@ mod test {
             },
             device_id: 1,
             mac_addr: [0x01, 0x00, 0x03, 0x00, 0x05, 0x00],
-            ip_addr: [0x00, 0x05, 0x00, 0x03, 0x00, 0x01],
+            ip_addr: 0x00050003,
         };
 
         let mut buf = io::Cursor::new(vec![0u8; 32]);
@@ -559,7 +610,7 @@ mod test {
             },
             device_id: 1,
             mac_addr: [0x01, 0x00, 0x03, 0x00, 0x05, 0x00],
-            ip_addr: [0x00, 0x05, 0x00, 0x03, 0x00, 0x01],
+            ip_addr: 0x00050003,
         };
 
         let mut buf = io::Cursor::new(vec![0u8; 32]);

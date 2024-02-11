@@ -15,13 +15,12 @@ pub mod wire {
     use bytemuck::Pod;
     use encoding_rs::{Encoding, UTF_16BE};
     use std::{
-        fmt::{self, Display},
+        fmt::Display,
         io::{self, Read},
         iter,
         marker::PhantomData,
         mem,
         ops::{Deref, DerefMut},
-        thread::AccessError,
     };
 
     #[binrw]
@@ -56,7 +55,7 @@ pub mod wire {
     }
 
     impl<T> ArgBlob<T> {
-        fn cast_items<U>(self) -> ArgBlob<U> {
+        pub fn cast_items<U>(self) -> ArgBlob<U> {
             ArgBlob {
                 data: self.data,
                 _phantom: PhantomData,
@@ -327,7 +326,7 @@ pub mod wire {
             Ok(DynSize::USize)
         }
 
-        fn read_args<'a>(size: DynSize) -> <Self as BinRead>::Args<'a> {
+        fn read_args<'a>(_size: DynSize) -> <Self as BinRead>::Args<'a> {
             ()
         }
 
@@ -593,19 +592,6 @@ pub mod wire {
         }
     }
 
-    const TYPES_SIZE: usize = 12;
-
-    #[binrw::writer(writer, endian)]
-    fn types_writer(string: &ArrayVec<ArgType, 12>) -> BinResult<()> {
-        let mut out = [0u8; TYPES_SIZE];
-        for (src, dst) in string.iter().zip(&mut out) {
-            *dst = *src as u8;
-        }
-
-        out.write_options(writer, endian, ())?;
-        Ok(())
-    }
-
     #[binrw]
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct Transaction {
@@ -619,8 +605,6 @@ pub mod wire {
         pub message_type: ArgNumber<u16>,
         pub args: Args,
     }
-
-    const MAX_MENU_REQUEST_COUNT: u32 = 64;
 
     impl Transaction {
         pub const SETUP_ID: u32 = 0xfffffffe;

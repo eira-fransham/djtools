@@ -14,3 +14,4 @@ parking_lot = "0.12"
 encoding_rs = "0.8"
 bytemuck = { version = "1", features = ["extern_crate_std"] }
 arrayvec = "0.7"
+mac_address = "1"
