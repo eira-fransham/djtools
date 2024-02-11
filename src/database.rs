@@ -7,15 +7,26 @@ use binrw::{BinRead, BinResult, BinWrite, Endian};
 
 pub mod wire {
     use arrayvec::ArrayVec;
-    use binrw::{binrw, BinRead, BinResult, BinWrite, Endian, NullWideString};
+    use binrw::{
+        binrw,
+        meta::{ReadEndian, WriteEndian},
+        BinRead, BinResult, BinWrite, Endian, NullWideString,
+    };
+    use bytemuck::Pod;
     use encoding_rs::{Encoding, UTF_16BE};
     use std::{
+        fmt::{self, Display},
         io::{self, Read},
+        iter,
+        marker::PhantomData,
         mem,
+        ops::{Deref, DerefMut},
+        thread::AccessError,
     };
 
     #[binrw]
     #[brw(repr = u8)]
+    #[brw(big)]
     #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
     pub enum ArgType {
         String = 0x02,
@@ -24,6 +35,7 @@ pub mod wire {
     }
 
     #[binrw]
+    #[brw(big)]
     #[derive(Debug, Clone, PartialEq, Eq, Hash)]
     pub struct ArgString(
         #[br(parse_with = utf16be_parser)]
@@ -32,12 +44,161 @@ pub mod wire {
     );
 
     #[binrw]
+    #[brw(big)]
     #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-    pub struct ArgBlob {
-        #[bw(try_calc(u32::try_from(data.len())))]
-        pub size: u32,
-        #[br(count = size)]
+    pub struct ArgBlob<Inner = u8, const FAKE_SIZE: usize = 0> {
+        #[bw(try_calc(ArgNumber::<BlobSize>::try_from(BlobSize::from(data.len()))))]
+        pub size: ArgNumber<BlobSize>,
+        #[br(count = *size.number)]
         pub data: Vec<u8>,
+
+        _phantom: PhantomData<Inner>,
+    }
+
+    impl<T> ArgBlob<T> {
+        fn cast_items<U>(self) -> ArgBlob<U> {
+            ArgBlob {
+                data: self.data,
+                _phantom: PhantomData,
+            }
+        }
+    }
+
+    impl<Inner: Pod> ArgBlob<Inner> {
+        pub fn from_items(items: Vec<Inner>) -> Self {
+            Self {
+                data: bytemuck::cast_vec(items),
+                _phantom: PhantomData,
+            }
+        }
+
+        pub fn items(&self) -> &[Inner] {
+            bytemuck::cast_slice(&*self.data)
+        }
+
+        pub fn items_mut(&mut self) -> &mut [Inner] {
+            bytemuck::cast_slice_mut(&mut *self.data)
+        }
+
+        pub fn into_items(self) -> Vec<Inner> {
+            bytemuck::cast_vec(self.data)
+        }
+    }
+
+    impl<Inner: BinWrite + WriteEndian, const FAKE_SIZE: usize> ArgBlob<Inner, FAKE_SIZE>
+    where
+        for<'a> Inner::Args<'a>: Default,
+    {
+        pub fn write_items<I>(items: I) -> BinResult<Self>
+        where
+            I: IntoIterator<Item = Inner>,
+        {
+            let items = items.into_iter();
+            let cap = items.size_hint().0.max(FAKE_SIZE);
+            let mut data = vec![0; cap];
+            let data = if FAKE_SIZE > 0 {
+                let mut out = io::Cursor::new(data);
+
+                for i in items {
+                    i.write(&mut out)?;
+                }
+
+                out.into_inner()
+            } else {
+                let mut out = io::Cursor::new(&mut data[..]);
+
+                for i in items {
+                    i.write(&mut out)?;
+                }
+
+                data
+            };
+
+            Ok(Self {
+                data,
+                _phantom: PhantomData,
+            })
+        }
+    }
+
+    // TODO: Currently doesn't work if the inner size is more than 1
+    impl<'a, Inner: BinRead, const FAKE_SIZE: usize> ArgBlob<Inner, FAKE_SIZE>
+    where
+        Inner::Args<'a>: Clone,
+    {
+        pub fn read_items_options(
+            &'a self,
+            endian: Endian,
+            args: Inner::Args<'a>,
+        ) -> impl Iterator<Item = BinResult<Inner>> + 'a {
+            #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+            enum State {
+                Unfinished,
+                Done,
+            }
+
+            let mut buf = [0u8; 1];
+            let mut reader = io::Cursor::new(&*self.data);
+            let mut state = State::Unfinished;
+
+            iter::from_fn(move || match &mut state {
+                State::Unfinished => {
+                    if let Err(e) = reader.read_exact(&mut buf) {
+                        state = State::Done;
+
+                        return match e.kind() {
+                            io::ErrorKind::UnexpectedEof => None,
+                            _ => Some(Err(binrw::Error::Io(e))),
+                        };
+                    }
+
+                    if buf == [0] {
+                        state = State::Done;
+                        None
+                    } else {
+                        match Inner::read_options(&mut io::Cursor::new(&buf), endian, args.clone())
+                        {
+                            Ok(ty) => Some(Ok(ty)),
+                            Err(e) => {
+                                state = State::Done;
+
+                                if FAKE_SIZE == 0 {
+                                    Some(Err(e))
+                                } else {
+                                    None
+                                }
+                            }
+                        }
+                    }
+                }
+                State::Done => None,
+            })
+        }
+    }
+
+    impl<'a, Inner: BinRead + ReadEndian, const FAKE_SIZE: usize> ArgBlob<Inner, FAKE_SIZE>
+    where
+        Inner::Args<'a>: Default + Clone,
+    {
+        pub fn read_items(&'a self) -> impl Iterator<Item = BinResult<Inner>> + 'a {
+            self.read_items_options(
+                Inner::ENDIAN.endian().unwrap_or(Endian::Big),
+                Default::default(),
+            )
+        }
+    }
+
+    impl<'a, Inner: BinRead, const FAKE_SIZE: usize> ArgBlob<Inner, FAKE_SIZE>
+    where
+        Inner::Args<'a>: Default + Clone,
+    {
+        pub fn read_items_le(&'a self) -> impl Iterator<Item = BinResult<Inner>> + 'a {
+            self.read_items_options(Endian::Little, Default::default())
+        }
+
+        pub fn read_items_be(&'a self) -> impl Iterator<Item = BinResult<Inner>> + 'a {
+            self.read_items_options(Endian::Big, Default::default())
+        }
     }
 
     const MAX_NUMBER_SIZE: usize = 4;
@@ -45,66 +206,171 @@ pub mod wire {
     const U8_MAGIC: u8 = 0x0f;
     const U16_MAGIC: u8 = 0x10;
     const U32_MAGIC: u8 = 0x11;
+    const USIZE_MAGIC: u8 = 0x14;
 
     #[binrw]
     #[brw(repr = u8)]
     #[repr(u8)]
     #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
-    pub enum NumberSize {
+    pub enum DynSize {
         U8 = U8_MAGIC,
         U16 = U16_MAGIC,
         U32 = U32_MAGIC,
+        USize = USIZE_MAGIC,
     }
 
-    impl NumberSize {
+    impl Default for DynSize {
+        fn default() -> Self {
+            Self::U32
+        }
+    }
+
+    impl DynSize {
         const fn to_byte_count(self) -> usize {
             match self {
                 Self::U8 => 1,
                 Self::U16 => 2,
-                Self::U32 => 4,
+                Self::U32 | Self::USize => 4,
             }
         }
 
-        fn try_from_byte_count(count: usize) -> Result<Self, io::Error> {
-            Ok(match count {
-                1 => Self::U8,
-                2 => Self::U16,
-                4 => Self::U32,
-                _ => return Err(io::ErrorKind::InvalidData.into()),
+        fn try_from_byte_count(size: usize) -> Result<DynSize, InvalidSize> {
+            Ok(match size {
+                1 => DynSize::U8,
+                2 => DynSize::U16,
+                4 => DynSize::U32,
+                _ => return Err(InvalidSize),
             })
+        }
+    }
+
+    #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub struct InvalidSize;
+
+    impl Display for InvalidSize {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "Invalid size")
+        }
+    }
+
+    pub trait ByteCountToSize: BinWrite + BinRead {
+        fn try_size(&self) -> Result<DynSize, InvalidSize>;
+        fn read_args<'a>(size: DynSize) -> <Self as BinRead>::Args<'a>;
+        fn write_args<'a>() -> <Self as BinWrite>::Args<'a>;
+    }
+
+    impl ByteCountToSize for DynNumber {
+        fn try_size(&self) -> Result<DynSize, InvalidSize> {
+            DynSize::try_from_byte_count(self.1.len())
+        }
+
+        fn read_args<'a>(size: DynSize) -> <Self as BinRead>::Args<'a> {
+            (size,)
+        }
+        fn write_args<'a>() -> <Self as BinWrite>::Args<'a> {
+            Default::default()
+        }
+    }
+
+    macro_rules! byte_count_to_size {
+        ($($t:ty),*) => {
+            $(
+                impl ByteCountToSize for $t {
+                    fn try_size(&self) -> Result<DynSize, InvalidSize> {
+                        DynSize::try_from_byte_count(mem::size_of::<$t>())
+                    }
+
+                    fn read_args<'a>(_: DynSize) -> <Self as BinRead>::Args<'a> {
+                        ()
+                    }
+
+                    fn write_args<'a>() -> <Self as BinWrite>::Args<'a> { Default::default() }
+                }
+            )*
+        }
+    }
+
+    byte_count_to_size!(u8, u16, u32, i8, i16, i32);
+
+    #[binrw]
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    #[repr(transparent)]
+    struct BlobSize(pub u32);
+
+    impl Deref for BlobSize {
+        type Target = u32;
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    impl DerefMut for BlobSize {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.0
+        }
+    }
+
+    impl From<u32> for BlobSize {
+        fn from(value: u32) -> Self {
+            Self(value)
+        }
+    }
+
+    impl From<usize> for BlobSize {
+        fn from(value: usize) -> Self {
+            Self(value as _)
+        }
+    }
+
+    impl ByteCountToSize for BlobSize {
+        fn try_size(&self) -> Result<DynSize, InvalidSize> {
+            Ok(DynSize::USize)
+        }
+
+        fn read_args<'a>(size: DynSize) -> <Self as BinRead>::Args<'a> {
+            ()
+        }
+
+        fn write_args<'a>() -> <Self as BinWrite>::Args<'a> {
+            Default::default()
         }
     }
 
     #[binrw]
     #[derive(Debug, Clone, PartialEq, Eq)]
-    pub struct ArgNumber {
-        #[bw(try_calc(NumberSize::try_from_byte_count(number.1.len())))]
-        size_tag: NumberSize,
-        #[br(args(size_tag))]
-        number: NumberInner,
+    pub struct ArgNumber<Inner: ByteCountToSize = DynNumber> {
+        #[bw(try_calc(<Inner>::try_size(&number)))]
+        size_tag: DynSize,
+        #[br(args_raw(<Inner as ByteCountToSize>::read_args(size_tag)))]
+        #[bw(args_raw(<Inner as ByteCountToSize>::write_args()))]
+        number: Inner,
+    }
+
+    impl<T> From<T> for ArgNumber<T>
+    where
+        T: ByteCountToSize,
+    {
+        fn from(number: T) -> Self {
+            Self { number }
+        }
     }
 
     impl ArgNumber {
+        pub fn from_bytes<const SIZE: usize>(bytes: [u8; SIZE]) -> Self
+        where
+            DynNumber: From<[u8; SIZE]>,
+        {
+            Self::from(DynNumber::from(bytes))
+        }
         pub fn bytes(&self) -> &[u8] {
             self.number.bytes()
         }
     }
 
-    impl<T> From<T> for ArgNumber
-    where
-        NumberInner: From<T>,
-    {
-        fn from(other: T) -> Self {
-            Self {
-                number: other.into(),
-            }
-        }
-    }
-
     #[derive(Debug, Clone, PartialEq, Eq)]
-    struct NumberInner(Endian, ArrayVec<u8, MAX_NUMBER_SIZE>);
+    pub struct DynNumber(Endian, ArrayVec<u8, MAX_NUMBER_SIZE>);
 
-    impl NumberInner {
+    impl DynNumber {
         fn bytes(&self) -> &[u8] {
             &*self.1
         }
@@ -124,55 +390,66 @@ pub mod wire {
         }
     }
 
-    impl From<[u8; 1]> for NumberInner {
+    impl From<[u8; 1]> for DynNumber {
         fn from(other: [u8; 1]) -> Self {
             Self(Endian::Big, other.into_iter().collect())
         }
     }
 
-    impl From<[u8; 2]> for NumberInner {
+    impl From<[u8; 2]> for DynNumber {
         fn from(other: [u8; 2]) -> Self {
             Self(Endian::Big, other.into_iter().collect())
         }
     }
 
-    impl From<[u8; 4]> for NumberInner {
+    impl From<[u8; 4]> for DynNumber {
         fn from(other: [u8; 4]) -> Self {
             Self(Endian::Big, other.into_iter().collect())
         }
     }
 
     macro_rules! number_int_conv {
-    ($($t:ty),*) => {
-        $(
-            impl From<NumberInner> for $t {
-                fn from(other: NumberInner) -> Self {
-                   Self::read_options(&mut io::Cursor::new(other.make_buf::<{mem::size_of::<$t>()}>()), other.0, ()).expect("This should never fail!")
+        ($($t:ty),*) => {
+            $(
+                impl From<DynNumber> for $t {
+                    fn from(other: DynNumber) -> Self {
+                       Self::read_options(&mut io::Cursor::new(other.make_buf::<{mem::size_of::<$t>()}>()), other.0, ()).expect("This should never fail!")
+                    }
                 }
-            }
 
-            impl From<$t> for NumberInner {
-                fn from(other: $t) -> Self {
-                    let endian = Endian::Big;
-                    let mut out = io::Cursor::new([0u8; mem::size_of::<$t>()]);
-                    other.write_options(&mut out, endian, ()).expect("This should never fail!");
+                impl From<$t> for DynNumber {
+                    fn from(other: $t) -> Self {
+                        let endian = Endian::Big;
+                        let mut out = io::Cursor::new([0u8; mem::size_of::<$t>()]);
+                        other.write_options(&mut out, endian, ()).expect("This should never fail!");
 
-                    Self(endian, out.into_inner().into_iter().collect())
+                        Self(endian, out.into_inner().into_iter().collect())
+                    }
                 }
-            }
 
-            impl From<ArgNumber> for $t {
-                fn from(other: ArgNumber) -> Self {
-                    Self::from(other.number)
+                impl<T> From<ArgNumber<T>> for $t
+                where
+                    T: ByteCountToSize,
+                    $t: From<T>,
+                {
+                    fn from(other: ArgNumber<T>) -> Self {
+                        Self::from(other.number)
+                    }
                 }
-            }
-        )*
-    };
-}
+
+                impl From<$t> for ArgNumber {
+                    fn from(other: $t) -> Self {
+                        Self { number: other.into() }
+                    }
+                }
+            )*
+        };
+    }
+
     number_int_conv!(u8, u16, u32, i8, i16, i32);
 
-    impl BinRead for NumberInner {
-        type Args<'a> = (NumberSize,);
+    impl BinRead for DynNumber {
+        type Args<'a> = (DynSize,);
 
         fn read_options<R: Read + io::Seek>(
             reader: &mut R,
@@ -192,7 +469,7 @@ pub mod wire {
         }
     }
 
-    impl BinWrite for NumberInner {
+    impl BinWrite for DynNumber {
         type Args<'a> = ();
 
         fn write_options<W: io::Write + io::Seek>(
@@ -252,16 +529,16 @@ pub mod wire {
     pub struct ArgVec(pub Vec<Arg>);
 
     impl BinRead for ArgVec {
-        type Args<'a> = (&'a [ArgType],);
+        type Args<'a> = (ArgBlob<ArgType, 12>,);
 
         fn read_options<R: Read + io::Seek>(
             reader: &mut R,
             endian: Endian,
             args: Self::Args<'_>,
         ) -> BinResult<Self> {
-            let args = args.0;
-            let mut out = Vec::with_capacity(args.len());
-            for t in args {
+            let args = args.0.read_items();
+            let mut out = Vec::with_capacity(args.size_hint().0);
+            for t in args.filter_map(Result::ok) {
                 out.push(match t {
                     ArgType::Blob => Arg::Blob(<_>::read_options(reader, endian, ())?),
                     ArgType::String => Arg::String(<_>::read_options(reader, endian, ())?),
@@ -302,49 +579,21 @@ pub mod wire {
         #[bw(try_calc(u8::try_from(args.0.len())))]
         #[brw(magic = 0x0f_u8)]
         _num_args: u8,
-        // This is apparently redundant, arg_types appears to always take up 12 bytes of space
-        #[bw(calc(TYPES_SIZE as _))]
-        // Blob size is 0x14 instead of 0x11 even though it's still a u32?
-        #[brw(magic = 0x14_u8)]
-        _type_size: u32,
-        #[br(parse_with = types_parser)]
-        #[bw(write_with = types_writer)]
-        pub arg_types: ArrayVec<ArgType, TYPES_SIZE>,
-        #[br(args(&arg_types[..]))]
+        #[bw(try_calc(ArgBlob::<ArgType, 12>::write_items(args.types())))]
+        arg_types: ArgBlob<ArgType, 12>,
+        #[br(args(arg_types))]
         pub args: ArgVec,
     }
 
     impl Args {
         fn new<A: Into<Arg>, I: IntoIterator<Item = A>>(args: I) -> Self {
-            let args = ArgVec(args.into_iter().map(Into::into).collect::<Vec<_>>());
-            let arg_types = args.types().collect::<ArrayVec<_, TYPES_SIZE>>();
-
-            Args { arg_types, args }
+            Args {
+                args: ArgVec(args.into_iter().map(Into::into).collect::<Vec<_>>()),
+            }
         }
     }
 
     const TYPES_SIZE: usize = 12;
-
-    #[binrw::parser(reader, endian)]
-    fn types_parser() -> BinResult<ArrayVec<ArgType, TYPES_SIZE>> {
-        let mut out = ArrayVec::default();
-        let mut buf = [0u8; 1];
-        for _ in 0..TYPES_SIZE {
-            reader.read_exact(&mut buf)?;
-
-            if buf == [0] {
-                reader.seek(io::SeekFrom::Current((TYPES_SIZE - out.len() - 1) as _))?;
-                break;
-            }
-
-            match ArgType::read_options(&mut io::Cursor::new(&buf), endian, ()) {
-                Ok(ty) => out.push(ty),
-                Err(e) => return Err(e),
-            }
-        }
-
-        Ok(out)
-    }
 
     #[binrw::writer(writer, endian)]
     fn types_writer(string: &ArrayVec<ArgType, 12>) -> BinResult<()> {
@@ -366,10 +615,8 @@ pub mod wire {
         #[brw(magic = 0x872349ae_u32)]
         #[bw(calc = ())]
         _magic_1: (),
-        #[brw(magic = 0x11_u8)]
-        pub transaction_id: u32,
-        #[brw(magic = 0x10_u8)]
-        pub message_type: u16,
+        pub transaction_id: ArgNumber<u32>,
+        pub message_type: ArgNumber<u16>,
         pub args: Args,
     }
 
@@ -382,8 +629,8 @@ pub mod wire {
 
         pub fn setup(player_number: u8) -> Self {
             Transaction {
-                transaction_id: Self::SETUP_ID,
-                message_type: Self::SETUP,
+                transaction_id: Self::SETUP_ID.into(),
+                message_type: Self::SETUP.into(),
                 args: Args::new([player_number as u32]),
             }
         }
@@ -400,10 +647,10 @@ pub mod wire {
 
             // TODO: Offset
             Transaction {
-                transaction_id,
-                message_type: Self::READ_MENU,
+                transaction_id: transaction_id.into(),
+                message_type: Self::READ_MENU.into(),
                 args: Args::new([
-                    ArgNumber::from([player, 1, slot, TRACK_TYPE]),
+                    ArgNumber::from_bytes([player, 1, slot, TRACK_TYPE]),
                     // TODO: Offset
                     0u32.into(),
                     // TODO: This is the count in just this current packet, i.e. it should be separate from the
@@ -466,7 +713,7 @@ impl TryFrom<wire::Transaction> for Transaction {
     type Error = FromWireError;
 
     fn try_from(value: wire::Transaction) -> Result<Self, Self::Error> {
-        match (value.transaction_id, value.message_type) {
+        match (value.transaction_id.into(), value.message_type.into()) {
             (wire::Transaction::SETUP_ID, wire::Transaction::SETUP) => {
                 if let [wire::Arg::Number(player_number)] = &*value.args.args.0 {
                     let player_number: u32 = player_number.clone().into();

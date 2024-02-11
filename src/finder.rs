@@ -1,27 +1,34 @@
 use acc_reader::AccReader;
-use binrw::{binrw, BinReaderExt, Endian};
+use arrayvec::ArrayVec;
+use binrw::{binrw, BinRead, BinReaderExt, BinResult, BinWrite, Endian};
 use chrono::{NaiveDateTime, Utc};
-use dashmap::{mapref::entry::Entry, DashMap};
+use dashmap::{
+    mapref::{entry::Entry, multiple::RefMulti},
+    DashMap,
+};
 use parking_lot::{Mutex, MutexGuard};
 use std::{
     borrow::Cow,
     collections::{btree_map, hash_map::RandomState, BTreeMap},
+    ffi::CStr,
     hash::BuildHasher,
     io::{self, ErrorKind, Read, Result, Write},
     iter::Map,
     marker::PhantomData,
     net::{SocketAddr, ToSocketAddrs, UdpSocket},
+    str,
 };
 
-pub const DEFAULT_ANNOUNCE_PORT: usize = 50000;
+pub const DEFAULT_ANNOUNCE_PORT: u16 = 50000;
 
-#[derive(Copy, Clone, Hash, PartialOrd, Ord, PartialEq, Eq)]
-struct DeviceId(u64);
+#[derive(Debug, Copy, Clone, Hash, PartialOrd, Ord, PartialEq, Eq)]
+pub struct DeviceId(pub u64);
 
-struct Device<Addr> {
-    last_seen: NaiveDateTime,
-    num_packets: u64,
-    address: Addr,
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub struct Device<Addr> {
+    pub last_seen: NaiveDateTime,
+    pub num_packets: u64,
+    pub address: Addr,
 }
 
 pub trait GetSource {
@@ -254,8 +261,16 @@ pub struct Finder<S: Socket, MapState = RandomState> {
     last_purge: NaiveDateTime,
 }
 
+impl Finder<UdpSocket> {
+    pub fn connect() -> io::Result<Self> {
+        let sock = UdpSocket::bind(("127.0.0.1", DEFAULT_ANNOUNCE_PORT))?;
+        sock.set_nonblocking(true)?;
+        Ok(Self::from_socket(sock))
+    }
+}
+
 impl<S: Socket, MapState: BuildHasher + Clone + Default> Finder<S, MapState> {
-    pub fn new(socket: S) -> Self {
+    pub fn from_socket(socket: S) -> Self {
         Self {
             socket,
             devices: Default::default(),
@@ -270,10 +285,19 @@ const PURGE_MAX_AGE_MS: usize = 5000;
 
 impl<S: Socket, MapState: BuildHasher + Clone> Finder<S, MapState> {
     pub fn update_known_devices(&self) -> Result<()> {
-        let recv = self.socket.receiver_from()?;
+        dbg!();
+        let recv = match self.socket.receiver_from() {
+            Ok(recv) => recv,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+            Err(other) => return Err(other),
+        };
+        dbg!();
         let addr = recv.source().clone();
+        dbg!();
 
+        dbg!();
         let mut by_last_seen = self.by_last_seen.lock();
+        dbg!();
 
         // TODO: We shouldn't just crash when receiving an invalid packet
         let linkpacket: DeviceLink = AccReader::new(recv)
@@ -281,10 +305,14 @@ impl<S: Socket, MapState: BuildHasher + Clone> Finder<S, MapState> {
             .map_err(|e| io::Error::new(ErrorKind::Other, e))?;
         let now = Utc::now().naive_utc();
 
+        dbg!(&linkpacket);
+
         let id = DeviceId(linkpacket.device_id as _);
 
+        dbg!();
         match self.devices.entry(id) {
             Entry::Occupied(mut entry) => {
+                dbg!();
                 let entry = entry.get_mut();
                 entry.num_packets += 1;
                 let last_seen = entry.last_seen;
@@ -294,16 +322,20 @@ impl<S: Socket, MapState: BuildHasher + Clone> Finder<S, MapState> {
                         ids.remove(i);
                     }
                 }
+                dbg!();
             }
             Entry::Vacant(entry) => {
+                dbg!();
                 entry.insert(Device {
                     last_seen: now,
                     num_packets: 1,
                     address: addr,
                 });
+                dbg!();
             }
         }
 
+        dbg!();
         match by_last_seen.entry(now) {
             btree_map::Entry::Occupied(mut entry) => {
                 entry.get_mut().push(id);
@@ -313,11 +345,21 @@ impl<S: Socket, MapState: BuildHasher + Clone> Finder<S, MapState> {
             }
         }
 
+        dbg!();
         if (now - self.last_purge).num_milliseconds() >= PURGE_FREQUENCY_MS as i64 {
+            dbg!();
             self.purge(&mut by_last_seen);
+            dbg!();
         }
 
         Ok(())
+    }
+
+    pub fn known_devices(
+        &self,
+    ) -> impl Iterator<Item = RefMulti<'_, DeviceId, Device<<S as Socket>::Addr>, MapState>> + '_
+    {
+        self.devices.iter()
     }
 
     fn purge(&self, by_last_seen: &mut MutexGuard<'_, LastSeen>) {
@@ -333,21 +375,121 @@ impl<S: Socket, MapState: BuildHasher + Clone> Finder<S, MapState> {
     }
 }
 
+const MAX_DEVICE_NAME_LEN: usize = 20;
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub struct DevName(pub ArrayVec<u8, MAX_DEVICE_NAME_LEN>);
+
+impl DevName {
+    pub fn new(name: &str) -> Self {
+        let mut out = ArrayVec::<_, MAX_DEVICE_NAME_LEN>::new();
+        out.try_extend_from_slice(&name.as_bytes()[..MAX_DEVICE_NAME_LEN.min(name.len())])
+            .expect("This should never fail!");
+        let _ = out.try_push(0);
+        Self(out)
+    }
+
+    pub fn try_to_str(&self) -> Option<&str> {
+        if self.0.is_full() {
+            str::from_utf8(&self.0[..]).ok()
+        } else {
+            let cstr = CStr::from_bytes_until_nul(&self.0).ok()?;
+
+            let s = cstr.to_str().ok()?;
+
+            Some(s)
+        }
+    }
+}
+
+impl From<&str> for DevName {
+    fn from(value: &str) -> Self {
+        Self::new(value)
+    }
+}
+
+impl BinWrite for DevName {
+    type Args<'a> = ();
+
+    fn write_options<W: Write + io::prelude::Seek>(
+        &self,
+        writer: &mut W,
+        endian: Endian,
+        args: Self::Args<'_>,
+    ) -> BinResult<()> {
+        let zeroes = [0; MAX_DEVICE_NAME_LEN];
+        let mut name = self.0.clone();
+        name.try_extend_from_slice(&zeroes[name.len()..])
+            .expect("This should never fail!");
+
+        name.write_options(writer, endian, args)
+    }
+}
+
+impl BinRead for DevName {
+    type Args<'a> = ();
+
+    fn read_options<R: Read + io::prelude::Seek>(
+        reader: &mut R,
+        endian: Endian,
+        args: Self::Args<'_>,
+    ) -> BinResult<Self> {
+        let arr = <[u8; MAX_DEVICE_NAME_LEN]>::read_options(reader, endian, args)?;
+
+        let mut out = ArrayVec::from(arr);
+
+        if let Some(first_zero) = out.iter().position(|b| *b == 0) {
+            out.truncate((first_zero + 1).min(out.capacity()));
+        }
+
+        Ok(DevName(out))
+    }
+}
+
 #[binrw]
+#[brw(big)]
+#[brw(magic = b"Qspt1WmJOL")]
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct Header {
+    header_type: u8,
+    #[brw(magic(0x00u8))]
+    #[bw(calc = ())]
+    _zero: (),
+    name: DevName,
+    #[brw(magic(0x01020036u32))]
+    #[bw(calc = ())]
+    _unknown: (),
+}
+
+#[binrw]
+#[brw(big)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
 struct DeviceLink {
-    #[bw(calc([0; 35]))]
-    _unknown0: [u8; 35],
+    header: Header,
     device_id: u8,
-    #[bw(calc([0; 54 - 1 - 35]))]
-    _unknown1: [u8; 54 - 1 - 35],
+    #[brw(magic(0x01u8))]
+    #[bw(calc = ())]
+    _unknown0: (),
+    mac_addr: [u8; 6],
+    ip_addr: [u8; 6],
+    #[brw(magic(0x0200u16))]
+    #[bw(calc = ())]
+    _unknown1: (),
+    #[brw(magic(0x00000164u32))]
+    #[bw(calc = ())]
+    _unknown2: (),
 }
 
 #[cfg(test)]
 mod test {
     use std::{
-        io::{self, Read, Write},
+        io::{self, Read, Seek as _, Write},
         net::UdpSocket,
     };
+
+    use binrw::{BinRead as _, BinWrite as _};
+
+    use crate::finder::{DeviceLink, Header};
 
     use super::{NetworkSendSocket, Socket};
 
@@ -381,5 +523,51 @@ mod test {
         sender.flush()?;
 
         Ok(())
+    }
+
+    #[test]
+    fn dysentery_parity() {
+        const ANNOUNCE_MESSAGE: &[u8] = &[
+            81, 115, 112, 116, 49, 87, 109, 74, 79, 76, 6, 0, 72, 101, 108, 108, 111, 44, 32, 119,
+            111, 114, 108, 100, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 0, 54, 1, 1, 1, 0, 3, 0, 5, 0, 0, 5,
+            0, 3, 0, 1, 2, 0, 0, 0, 1, 100,
+        ];
+
+        let message = DeviceLink {
+            header: Header {
+                header_type: 0x06,
+                name: "Hello, world".into(),
+            },
+            device_id: 1,
+            mac_addr: [0x01, 0x00, 0x03, 0x00, 0x05, 0x00],
+            ip_addr: [0x00, 0x05, 0x00, 0x03, 0x00, 0x01],
+        };
+
+        let mut buf = io::Cursor::new(vec![0u8; 32]);
+
+        message.write(&mut buf).unwrap();
+
+        assert_eq!(buf.get_ref(), ANNOUNCE_MESSAGE);
+    }
+
+    #[test]
+    fn round_trip() {
+        let message = DeviceLink {
+            header: Header {
+                header_type: 0x06,
+                name: "Hello, world".into(),
+            },
+            device_id: 1,
+            mac_addr: [0x01, 0x00, 0x03, 0x00, 0x05, 0x00],
+            ip_addr: [0x00, 0x05, 0x00, 0x03, 0x00, 0x01],
+        };
+
+        let mut buf = io::Cursor::new(vec![0u8; 32]);
+
+        message.write(&mut buf).unwrap();
+
+        buf.seek(io::SeekFrom::Start(0)).unwrap();
+
+        assert_eq!(message, DeviceLink::read(&mut buf).unwrap());
     }
 }
