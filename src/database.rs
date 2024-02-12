@@ -1,6 +1,7 @@
 use std::{
     fmt::Display,
     io::{Read, Seek, Write},
+    ops::{Range, RangeBounds},
 };
 
 use binrw::{BinRead, BinResult, BinWrite, Endian};
@@ -15,12 +16,13 @@ pub mod wire {
     use bytemuck::Pod;
     use encoding_rs::{Encoding, UTF_16BE};
     use std::{
-        fmt::Display,
+        cmp,
+        fmt::{Debug, Display},
         io::{self, Read},
         iter,
         marker::PhantomData,
         mem,
-        ops::{Deref, DerefMut},
+        ops::{Add, AddAssign, Bound, Deref, DerefMut, Div, Mul, RangeBounds, Sub},
     };
 
     #[binrw]
@@ -210,12 +212,31 @@ pub mod wire {
     #[binrw]
     #[brw(repr = u8)]
     #[repr(u8)]
-    #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+    #[derive(Debug, Copy, Clone, PartialOrd, PartialEq, Eq, Hash)]
     pub enum DynSize {
         U8 = U8_MAGIC,
         U16 = U16_MAGIC,
         U32 = U32_MAGIC,
         USize = USIZE_MAGIC,
+    }
+
+    impl Ord for DynSize {
+        fn cmp(&self, other: &Self) -> cmp::Ordering {
+            use DynSize::*;
+
+            match (self, other) {
+                (U8, U8)
+                | (U16, U16)
+                | (U32, U32)
+                | (U32, USize)
+                | (USize, U32)
+                | (USize, USize) => cmp::Ordering::Equal,
+                (U8, _) => cmp::Ordering::Less,
+                (_, U8) => cmp::Ordering::Greater,
+                (U16, _) => cmp::Ordering::Less,
+                (_, U16) => cmp::Ordering::Less,
+            }
+        }
     }
 
     impl Default for DynSize {
@@ -336,6 +357,7 @@ pub mod wire {
     }
 
     #[binrw]
+    #[brw(big)]
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct ArgNumber<Inner: ByteCountToSize = DynNumber> {
         #[bw(try_calc(<Inner>::try_size(&number)))]
@@ -343,6 +365,91 @@ pub mod wire {
         #[br(args_raw(<Inner as ByteCountToSize>::read_args(size_tag)))]
         #[bw(args_raw(<Inner as ByteCountToSize>::write_args()))]
         number: Inner,
+    }
+
+    macro_rules! dynnumber_arith {
+        ($($trt:ident :: $f:ident),*) => {
+            $(
+                impl $trt for DynNumber {
+                    type Output = Self;
+
+                    fn $f(self, rhs: Self) -> Self::Output {
+                        fn inner<T>(lhs: DynNumber, rhs: DynNumber) -> DynNumber where T: From<DynNumber> + $trt, DynNumber: From<T::Output> {
+                            let lhs = T::from(lhs);
+                            let rhs = T::from(rhs);
+                            $trt::$f(lhs, rhs).into()
+                        }
+
+                        // TODO: Don't unwrap here
+                        match self.try_size().unwrap().max(rhs.try_size().unwrap()) {
+                            DynSize::U32 | DynSize::USize => inner::<u32>(self, rhs),
+                            DynSize::U16 => inner::<u16>(self, rhs),
+                            DynSize::U8 => inner::<u8>(self, rhs),
+                        }
+                    }
+                }
+
+                impl<T> $trt for ArgNumber<T>
+                where
+                    T: $trt + ByteCountToSize,
+                    T::Output: ByteCountToSize,
+                {
+                    type Output = ArgNumber<T::Output>;
+
+                    fn $f(self, rhs: Self) -> Self::Output {
+                        ArgNumber { number: $trt::$f(self.number, rhs.number) }
+                    }
+                }
+            )*
+        };
+    }
+
+    dynnumber_arith!(Add::add, Mul::mul, Sub::sub, Div::div);
+
+    impl<I> AddAssign<u8> for ArgNumber<I>
+    where
+        I: ByteCountToSize + AddAssign<u8>,
+    {
+        fn add_assign(&mut self, rhs: u8) {
+            self.number += rhs;
+        }
+    }
+
+    impl AddAssign<u8> for DynNumber {
+        fn add_assign(&mut self, mut rhs: u8) {
+            // Reversed and forward iterators have incompatible types, unfortunately
+            macro_rules! inner {
+                ($e:expr) => {
+                    for i in $e {
+                        let (res, overflowed) = i.overflowing_add(rhs);
+                        *i = res;
+                        if overflowed {
+                            rhs = 1;
+                        } else {
+                            break;
+                        }
+                    }
+                };
+            }
+
+            match self.0 {
+                Endian::Little => inner!(self.1.iter_mut()),
+                Endian::Big => inner!(self.1.iter_mut().rev()),
+            }
+        }
+    }
+
+    impl<T, U> Add<U> for ArgNumber<T>
+    where
+        T: ByteCountToSize,
+        ArgNumber<T>: AddAssign<U>,
+    {
+        type Output = Self;
+
+        fn add(mut self, rhs: U) -> Self::Output {
+            self += rhs;
+            self
+        }
     }
 
     impl<T> From<T> for ArgNumber<T>
@@ -619,15 +726,33 @@ pub mod wire {
             }
         }
 
-        pub fn read_menu<C: Into<ArgNumber>>(
+        pub fn read_menu<CI, RI, R>(
             transaction_id: u32,
             player: u8,
             slot: u8,
-            count: C,
-        ) -> Self {
+            total_count: CI,
+            range: &R,
+        ) -> Self
+        where
+            CI: Into<ArgNumber>,
+            RI: Clone + Into<ArgNumber>,
+            R: RangeBounds<RI>,
+        {
             const TRACK_TYPE: u8 = 1;
 
-            let count = count.into();
+            let total_count = total_count.into();
+            let start = match range.start_bound().map(|i| i.clone().into()) {
+                Bound::Excluded(i) => i + 1,
+                Bound::Included(i) => i,
+                Bound::Unbounded => 0u32.into(),
+            };
+            let count = match range.end_bound().map(|i| i.clone().into()) {
+                Bound::Excluded(end) => end - start.clone(),
+                // TODO: This doesn't handle if `end` is the max value of the number, but we could handle that by
+                //       doing either (end - start) + 1 _or_ (end  + 1) - start. Not important, though.
+                Bound::Included(end) => (end + 1) - start.clone(),
+                Bound::Unbounded => total_count.clone() - start.clone(),
+            };
 
             // TODO: Offset
             Transaction {
@@ -636,13 +761,13 @@ pub mod wire {
                 args: Args::new([
                     ArgNumber::from_bytes([player, 1, slot, TRACK_TYPE]),
                     // TODO: Offset
-                    0u32.into(),
+                    start,
                     // TODO: This is the count in just this current packet, i.e. it should be separate from the
                     //       total and limited to `MAX_MENU_REQUEST_COUNT`
-                    count.clone(),
+                    count,
                     // Always zero
                     0u32.into(),
-                    count.clone(),
+                    total_count,
                     // Always zero
                     0u32.into(),
                 ]),
@@ -652,7 +777,7 @@ pub mod wire {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum Transaction {
+pub enum Transaction<R> {
     Setup {
         player_number: u8,
     },
@@ -660,20 +785,25 @@ pub enum Transaction {
         id: u32,
         player_number: u8,
         slot: u8,
-        count: u32,
+        total_count: u32,
+        range: R,
     },
 }
 
-impl From<&Transaction> for wire::Transaction {
-    fn from(value: &Transaction) -> Self {
-        match *value {
-            Transaction::Setup { player_number } => Self::setup(player_number),
+impl<R> From<&Transaction<R>> for wire::Transaction
+where
+    R: RangeBounds<u32>,
+{
+    fn from(value: &Transaction<R>) -> Self {
+        match value {
+            Transaction::Setup { player_number } => Self::setup(*player_number),
             Transaction::ReadMenu {
                 id,
                 player_number,
                 slot,
-                count,
-            } => Self::read_menu(id, player_number, slot, count),
+                total_count,
+                range,
+            } => Self::read_menu(*id, *player_number, *slot, *total_count, range),
         }
     }
 }
@@ -693,7 +823,7 @@ impl Display for FromWireError {
     }
 }
 
-impl TryFrom<wire::Transaction> for Transaction {
+impl TryFrom<wire::Transaction> for Transaction<Range<u32>> {
     type Error = FromWireError;
 
     fn try_from(value: wire::Transaction) -> Result<Self, Self::Error> {
@@ -710,9 +840,13 @@ impl TryFrom<wire::Transaction> for Transaction {
             }
             (id, wire::Transaction::READ_MENU) => {
                 use wire::Arg::Number as N;
-                if let [N(args), N(_offset), N(count), N(_), N(_count), N(_)] = &*value.args.args.0
+                if let [N(args), N(offset), N(count), N(_), N(total_count), N(_)] =
+                    &*value.args.args.0
                 {
-                    let count = count.clone().into();
+                    let offset = u32::from(offset.clone());
+                    let count = u32::from(count.clone());
+                    let total_count = u32::from(total_count.clone());
+
                     if let [player_number, _1, slot, _track_type] = args.bytes() {
                         let player_number = *player_number;
                         let slot = *slot;
@@ -721,7 +855,8 @@ impl TryFrom<wire::Transaction> for Transaction {
                             id,
                             player_number,
                             slot,
-                            count,
+                            total_count,
+                            range: offset.clone()..offset + count,
                         })
                     } else {
                         Err(FromWireError::InvalidArgs)
@@ -735,7 +870,7 @@ impl TryFrom<wire::Transaction> for Transaction {
     }
 }
 
-impl BinRead for Transaction {
+impl BinRead for Transaction<Range<u32>> {
     type Args<'a> = <wire::Transaction as BinRead>::Args<'a>;
 
     fn read_options<R: Read + Seek>(
@@ -753,7 +888,10 @@ impl BinRead for Transaction {
     }
 }
 
-impl BinWrite for Transaction {
+impl<Range> BinWrite for Transaction<Range>
+where
+    Range: RangeBounds<u32>,
+{
     type Args<'a> = <wire::Transaction as BinWrite>::Args<'a>;
 
     fn write_options<W: Write + Seek>(
@@ -797,7 +935,8 @@ mod test {
                     id: 1,
                     player_number: 3,
                     slot: 1,
-                    count: 32,
+                    total_count: 32,
+                    range: ..,
                 },
                 READ_MENU_MESSAGE,
             ),
@@ -821,7 +960,8 @@ mod test {
                 id: 1,
                 player_number: 1,
                 slot: 1,
-                count: 0xff,
+                total_count: 0xff,
+                range: 1..5,
             },
         ];
 
